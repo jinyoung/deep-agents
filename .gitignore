@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Input/Output
+input/
+output/
+/tmp/
+
+# Env (키 포함 - .env.example만 커밋)
+.env
+frontend/.env

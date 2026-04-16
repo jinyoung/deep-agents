@@ -28,9 +28,109 @@ load_dotenv()
 CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "deepagents-sandbox")
 SANDBOX_WORKDIR = os.environ.get("SANDBOX_WORKDIR", "/workspace")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "openai:gpt-5")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")
 
 _agent = None
 _sessions: dict[str, list] = {}
+
+
+def _patch_text_tool_calls(response):
+    """sglang/vLLM 모델이 tool_calls 대신 텍스트로 도구 호출을 출력하는 경우 후처리.
+
+    모델이 <|start|>assistant<|channel|>commentary to=TOOL code<|message|>{...} 형태로
+    도구 호출을 텍스트에 삽입하면, 이를 파싱하여 정규 tool_calls로 변환한다.
+    """
+    from langchain_core.messages import AIMessage
+
+    if not isinstance(response, AIMessage):
+        return response
+    # 이미 tool_calls가 있으면 패스
+    if response.tool_calls:
+        return response
+
+    content = response.content
+    if not isinstance(content, str) or "<|" not in content:
+        return response
+
+    # 패턴: <|start|>assistant<|channel|>commentary to=TOOL_NAME code<|message|>{JSON}
+    # 또는 <|start|>assistant<|channel|>tool to=TOOL_NAME<|message|>{JSON}
+    pattern = r'<\|start\|>assistant<\|channel\|>(?:commentary\s+to|tool\s+to)=(\w+)[^<]*<\|message\|>\s*(\{.*)'
+    match = re.search(pattern, content, re.DOTALL)
+    if not match:
+        # <| 토큰만 있고 도구 호출 패턴이 아닌 경우: 토큰 정리만
+        cleaned = re.sub(r'<\|[^|]*\|>', '', content).strip()
+        if cleaned != content:
+            return AIMessage(
+                content=cleaned,
+                additional_kwargs=response.additional_kwargs,
+                response_metadata=response.response_metadata,
+                id=response.id,
+            )
+        return response
+
+    tool_name = match.group(1)
+    json_str = match.group(2)
+
+    # JSON 추출 (중첩 브레이스 대응)
+    depth = 0
+    end_idx = 0
+    for i, ch in enumerate(json_str):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    if end_idx == 0:
+        return response
+
+    try:
+        args = json.loads(json_str[:end_idx])
+    except json.JSONDecodeError:
+        return response
+
+    # 텍스트 부분 (도구 호출 앞의 설명)
+    pre_text = content[:match.start()].strip()
+    # <| 잔여 토큰 제거
+    pre_text = re.sub(r'<\|[^|]*\|>', '', pre_text).strip()
+
+    call_id = f"call_{uuid.uuid4().hex[:24]}"
+
+    return AIMessage(
+        content=pre_text,
+        tool_calls=[{"name": tool_name, "args": args, "id": call_id, "type": "tool_call"}],
+        additional_kwargs=response.additional_kwargs,
+        response_metadata=response.response_metadata,
+        id=response.id,
+    )
+
+
+def _init_model():
+    """환경변수에 따라 모델 인스턴스 생성"""
+    if OPENAI_BASE_URL:
+        # 커스텀 OpenAI-호환 엔드포인트 (sglang, vLLM 등)
+        from langchain_openai import ChatOpenAI
+
+        class PatchedChatOpenAI(ChatOpenAI):
+            """ChatOpenAI 서브클래스: 텍스트 기반 tool call → 정규 tool_calls 변환."""
+
+            def _generate(self, *args, **kwargs):
+                result = super()._generate(*args, **kwargs)
+                # 각 generation의 message를 후처리
+                for gen in result.generations:
+                    gen.message = _patch_text_tool_calls(gen.message)
+                return result
+
+        return PatchedChatOpenAI(
+            model=OPENAI_MODEL,
+            base_url=OPENAI_BASE_URL,
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            temperature=0,
+            streaming=False,
+        )
+    # 기본: deepagents의 provider:model 포맷 (예: "openai:gpt-5")
+    return OPENAI_MODEL
 
 
 def get_agent():
@@ -43,34 +143,15 @@ def get_agent():
             workdir=SANDBOX_WORKDIR,
         )
         _agent = create_deep_agent(
-            model=OPENAI_MODEL,
-            skills=["skills/"],
+            model=_init_model(),
+           # skills=["skills/"],
             backend=backend,
             system_prompt=(
-                "당신은 엑셀 파일 전문가입니다. "
-                "사용자의 요청에 따라 execute 도구로 Python 코드를 직접 실행하여 엑셀 파일을 만들거나, "
-                "사용자가 업로드한 /workspace/uploads/ 의 파일을 분석/편집할 수 있습니다.\n\n"
-                "## 응답 스타일 (매우 중요)\n"
-                "도구를 호출하기 전에, 반드시 먼저 한국어로 지금 무엇을 할 것인지 "
-                "1~2문장으로 설명한 후 도구를 호출하세요. 예시:\n"
-                '- "먼저 업로드된 파일 목록을 확인하겠습니다."\n'
-                '- "PDF에서 테이블 구조를 추출하겠습니다."\n'
-                '- "추출된 데이터를 기반으로 엑셀 파일을 생성하겠습니다."\n'
-                '- "수식을 검증하기 위해 recalc.py를 실행하겠습니다."\n'
-                "도구 결과를 받은 후에도 결과를 간단히 요약해주세요. "
-                "절대로 설명 없이 도구만 연속 호출하지 마세요.\n\n"
-                "## 중요 규칙\n"
-                "- 반드시 Excel 수식을 사용하고, Python에서 값을 계산하여 하드코딩하지 마세요.\n"
-                "- openpyxl, pandas, pdfplumber 라이브러리가 설치되어 있습니다.\n"
-                "- PDF 파일은 바이너리이므로 read_file 도구로 읽지 마세요. "
-                "반드시 execute 도구로 pdfplumber를 사용하여 읽으세요:\n"
-                "  ```python\nimport pdfplumber\nwith pdfplumber.open('/workspace/uploads/파일.pdf') as pdf:\n"
-                "    for page in pdf.pages:\n        print(page.extract_text())\n```\n"
-                "- 수식이 포함된 엑셀 파일을 만든 후에는 반드시 "
-                "python /workspace/skills/xlsx/scripts/recalc.py <파일경로> 를 실행하여 "
-                "수식 값을 재계산하고 오류를 검증하세요.\n"
-                "- 파일은 /workspace/output/ 디렉토리에 저장하세요.\n"
-                "- 한국어로 응답하세요."
+                "한국어로 응답하세요. execute 도구로 Python을 실행할 수 있습니다. "
+                "openpyxl, pandas, pdfplumber가 설치되어 있습니다. "
+                "PDF는 execute로 pdfplumber를 사용하세요. "
+                "파일 저장은 /workspace/output/에 하세요. "
+                "각 도구 호출 전에 한국어로 간단히 설명하세요."
             ),
         )
     return _agent
@@ -200,9 +281,12 @@ def _run_agent_in_thread(prompt: str, session_id: str, aq: asyncio.Queue, loop: 
         history = _sessions[session_id]
         history.append(HumanMessage(content=prompt))
 
+        # 커스텀 모델(vLLM 등)은 messages 스트리밍에서 tool calling 파싱 실패 가능
+        # updates 모드만 사용하여 invoke 기반으로 안정적으로 동작
+        stream_modes = ["messages", "updates"] if not OPENAI_BASE_URL else ["updates"]
         for mode, payload in ag.stream(
             {"messages": list(history)},
-            stream_mode=["messages", "updates"],
+            stream_mode=stream_modes,
         ):
             loop.call_soon_threadsafe(aq.put_nowait, (mode, payload))
     except Exception as e:
@@ -325,13 +409,77 @@ async def _generate_sse(prompt: str, session_id: str):
                 )
 
         elif mode == "updates":
-            for node_name in payload:
+            for node_name, node_data in payload.items():
                 if node_name.startswith("__"):
                     continue
                 # 스킬 로드 감지
                 if "SkillsMiddleware" in node_name and node_name not in seen_skills:
                     seen_skills.add(node_name)
                     yield _format_sse("skill_loaded", {"name": "xlsx"})
+
+                # updates 모드에서 메시지 추출 (커스텀 모델 호환)
+                if isinstance(node_data, dict) and "messages" in node_data:
+                    from langchain_core.messages import AIMessage
+                    msgs_raw = node_data["messages"]
+                    # deepagents는 Overwrite 래퍼를 사용할 수 있음
+                    if hasattr(msgs_raw, 'value'):
+                        msgs_raw = msgs_raw.value
+                    if not isinstance(msgs_raw, list):
+                        msgs_raw = [msgs_raw] if msgs_raw else []
+                    for msg in msgs_raw:
+                        # AI 텍스트 응답
+                        if isinstance(msg, AIMessage):
+                            if msg.content:
+                                text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                if text.strip() and not text.startswith("<|"):
+                                    yield _format_sse("token", {"text": text, "node": node_name})
+                            # 도구 호출
+                            if msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    tc_name = tc.get("name", "")
+                                    pending_tool_names[tc.get("id", "")] = tc_name
+                                    yield _format_sse(
+                                        "tool_start",
+                                        {"tool_call_id": tc.get("id", ""), "name": tc_name, "node": node_name},
+                                    )
+                        # 도구 결과
+                        elif isinstance(msg, ToolMessage):
+                            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                            tool_name = msg.name or pending_tool_names.get(msg.tool_call_id, "")
+
+                            if tool_name == "write_todos":
+                                todos = []
+                                try:
+                                    import ast
+                                    bi = content.find("[")
+                                    if bi >= 0:
+                                        todos = ast.literal_eval(content[bi:])
+                                except Exception:
+                                    pass
+                                if todos:
+                                    yield _format_sse("todos", {"items": todos})
+
+                            if tool_name in ("ls", "read_file", "glob"):
+                                file_matches = re.findall(r"/workspace/uploads/[^'\"\]\n]+", content)
+                                for fm in file_matches:
+                                    fm = fm.rstrip(" ,")
+                                    fname = fm.split("/workspace/uploads/")[-1]
+                                    if fname and fname not in seen_refs:
+                                        seen_refs.add(fname)
+                                        yield _format_sse("ref_file", {"name": fname, "path": fm})
+
+                            if "/workspace/output/" in content:
+                                found = re.findall(r"/workspace/output/[\w\-\.]+", content)
+                                for fp in found:
+                                    fname = Path(fp).name
+                                    if fname not in generated_files:
+                                        generated_files.append(fname)
+
+                            yield _format_sse(
+                                "tool_result",
+                                {"tool_call_id": msg.tool_call_id or "", "name": tool_name, "content": content[:3000], "node": node_name},
+                            )
+
                 yield _format_sse("node_update", {"node": node_name})
 
     # output 디렉토리 스캔
